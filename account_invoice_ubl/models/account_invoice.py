@@ -145,7 +145,8 @@ class AccountInvoice(models.Model):
         line_amount = etree.SubElement(
             line_root, ns['cbc'] + 'LineExtensionAmount',
             currencyID=cur_name)
-        line_amount.text = '%0.*f' % (account_precision, iline.price_subtotal)
+        price_subtotal = self._ubl_get_invoice_line_price_subtotal(iline)
+        line_amount.text = '%0.*f' % (account_precision, price_subtotal)
         self._ubl_add_invoice_line_tax_total(
             iline, line_root, ns, version=version)
         self._ubl_add_item(
@@ -159,7 +160,7 @@ class AccountInvoice(models.Model):
         # to get a *tax_excluded* price unit
         if not float_is_zero(qty, precision_digits=qty_precision):
             price_unit = float_round(
-                iline.price_subtotal / float(qty),
+                price_subtotal / float(qty),
                 precision_digits=price_precision)
         price_amount.text = '%0.*f' % (price_precision, price_unit)
         if uom_unece_code:
@@ -170,6 +171,11 @@ class AccountInvoice(models.Model):
             base_qty = etree.SubElement(price_node, ns['cbc'] + 'BaseQuantity')
         base_qty.text = '%0.*f' % (qty_precision, qty)
 
+    @api.multi
+    def _ubl_get_invoice_line_price_subtotal(self, iline):
+        self.ensure_one()
+        return iline.price_subtotal
+
     def _ubl_add_invoice_line_tax_total(
             self, iline, parent_node, ns, version='2.1'):
         cur_name = self.currency_id.name
@@ -179,6 +185,8 @@ class AccountInvoice(models.Model):
         res_taxes = iline.invoice_line_tax_id.compute_all(
             price, iline.quantity, product=iline.product_id,
             partner=self.partner_id)
+        res_taxes = self._ubl_get_invoice_line_tax_hook(iline, res_taxes)
+
         tax_total = float_round(
             res_taxes['total_included'] - res_taxes['total'],
             precision_digits=prec)
@@ -191,6 +199,14 @@ class AccountInvoice(models.Model):
             self._ubl_add_tax_subtotal(
                 False, res_tax['amount'], tax, cur_name, tax_total_node, ns,
                 version=version)
+
+    @api.multi
+    def _ubl_get_invoice_line_tax_hook(self, iline, res_taxes):
+        """
+        For some scenarios it is necessary to modify the already calculated
+        taxes.
+        """
+        return res_taxes
 
     @api.multi
     def get_delivery_partner(self):
@@ -236,8 +252,9 @@ class AccountInvoice(models.Model):
         self._ubl_add_customer_party(
             self.partner_id, False, 'AccountingCustomerParty', xml_root, ns,
             version=version)
-        # delivery_partner = self.get_delivery_partner()
-        # self._ubl_add_delivery(delivery_partner, xml_root, ns)
+        delivery_partner = self.get_delivery_partner()
+        if delivery_partner:
+            self._ubl_add_delivery(delivery_partner, xml_root, ns)
         # Put paymentmeans block even when invoice is paid ?
         self._ubl_add_payment_means(
             self.partner_bank_id, self.payment_mode_id, self.date_due,
@@ -249,11 +266,19 @@ class AccountInvoice(models.Model):
         self._ubl_add_legal_monetary_total(xml_root, ns, version=version)
 
         line_number = 0
-        for iline in self.invoice_line:
+        for iline in self._ubl_get_invoice_lines():
             line_number += 1
             self._ubl_add_invoice_line(
                 xml_root, iline, line_number, ns, version=version)
         return xml_root
+
+    @api.multi
+    def _ubl_get_invoice_lines(self):
+        """
+        The list of invoice lines to iterate over for generating ubl docs.
+        """
+        self.ensure_one()
+        return self.invoice_line
 
     @api.multi
     def generate_ubl_xml_string(self, version='2.1'):
